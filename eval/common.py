@@ -396,7 +396,7 @@ def normalize_extracted_answer(extracted_answer: str) -> str:
 
 
 def url_to_fileobj(url: str, binary=False) -> Any:
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
     return io.BytesIO(response.content) if binary else io.StringIO(response.text)
 
