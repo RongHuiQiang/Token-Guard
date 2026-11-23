@@ -44,7 +44,7 @@ import generation_utils
 
 class GuardedDecoder:
     def __init__(self, scorer, temperature=0.7, m_candidates=5,
-                 max_new_tokens=256):
+                 max_new_tokens=256, use_hooks=True):
         self.scorer = scorer          # FastLatentEnvironment (model+tokenizer+config)
         self.model = scorer.model
         self.tokenizer = scorer.tokenizer
@@ -52,6 +52,19 @@ class GuardedDecoder:
         self.temperature = temperature
         self.m_candidates = m_candidates
         self.max_new_tokens = max_new_tokens
+        # hidden-states 钩子：output_hidden_states=True 每次前向物化全部 33 层
+        # （prefill 时 ~2.7GB 无谓流量），实际只用 hs[0] 与 hs[-2]。
+        # hs[0]=embed_tokens 输出；hs[-2]=最后一个 decoder 层输出（final norm 前）
+        self.use_hooks = use_hooks
+        self._h_emb = [None]
+        self._h_last = [None]
+        if use_hooks:
+            core = getattr(self.model, 'model', self.model)   # LlamaModel
+            core.embed_tokens.register_forward_hook(
+                lambda m, i, o: self._h_emb.__setitem__(0, o))
+            core.layers[-1].register_forward_hook(
+                lambda m, i, o: self._h_last.__setitem__(
+                    0, o[0] if isinstance(o, tuple) else o))
 
     @torch.no_grad()
     def decode(self, prompt_text, h_bar_init, stop_str=None):
@@ -87,11 +100,15 @@ class GuardedDecoder:
         cur = input_ids
         for _ in range(self.max_new_tokens):
             out = model(cur, past_key_values=past, use_cache=True,
-                        output_hidden_states=True)
+                        output_hidden_states=not self.use_hooks)
             past = out.past_key_values
             logits = out.logits[0, -1].float()
-            h_pos = out.hidden_states[-2][0, -1]        # fp16 [d]
-            e_pos = out.hidden_states[0][0, -1]
+            if self.use_hooks:
+                h_pos = self._h_last[0][0, -1]           # fp16 [d]（=hs[-2]）
+                e_pos = self._h_emb[0][0, -1]
+            else:
+                h_pos = out.hidden_states[-2][0, -1]
+                e_pos = out.hidden_states[0][0, -1]
 
             probs = torch.softmax(logits / self.temperature, dim=-1)
             top_p, top_i = torch.topk(probs, self.m_candidates)
@@ -192,11 +209,15 @@ class GuardedDecoder:
         for t in range(self.max_new_tokens):
             out = model(cur, past_key_values=past, attention_mask=mask_full,
                         position_ids=positions, use_cache=True,
-                        output_hidden_states=True)
+                        output_hidden_states=not self.use_hooks)
             past = out.past_key_values
             logits = out.logits[:, -1].float()                       # [B, V]
-            h_pos = out.hidden_states[-2][:, -1]                     # [B, d]
-            e_pos = out.hidden_states[0][:, -1]
+            if self.use_hooks:
+                h_pos = self._h_last[0][:, -1]                       # [B, d]
+                e_pos = self._h_emb[0][:, -1]
+            else:
+                h_pos = out.hidden_states[-2][:, -1]
+                e_pos = out.hidden_states[0][:, -1]
 
             probs = torch.softmax(logits / self.temperature, dim=-1)
             top_p, top_i = torch.topk(probs, self.m_candidates, dim=-1)   # [B, M]
@@ -519,17 +540,19 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
         a = _last_answer(final_text)
         if (a and 'short sentence' in system_prompt.lower()
                 and a.rstrip('.').strip().lower() in ('yes', 'no', 'maybe')):
+            # 半句强制续写：seed 给 "Answer: <label>. The passage"，
+            # 模型只能续出内容句（对"给一句依据"的开放式请求模型常摆烂回标签）
+            lab = a.rstrip('.').strip()
             gdec.max_new_tokens = 128
             sup, _s, _n, _g = gdec.decode(
                 final_prompt + final_text
-                + "\nOne supporting sentence from the passage (one sentence only, no label):",
-                h_x, stop_str="\n")
+                + "\nAnswer: " + lab + ". The passage",
+                h_x, stop_str=None)
             gdec.max_new_tokens = saved
-            sup = sup.strip().strip('"')
-            sup = _re.sub(r'^(yes|no|maybe)[.:]\s*', '', sup, flags=_re.I)
-            if len(sup.split()) >= 4:
-                final_text = (final_text + "\nAnswer: "
-                              + a.rstrip('.').strip() + ". " + sup)
+            sup = ("The passage " + sup.strip()).strip('"')
+            sup = _re.sub(r'^(yes|no|maybe)[.:]\s*', '', sup, flags=_re.I).strip()
+            if len(sup.split()) >= 6 and not sup.rstrip('.').lower().endswith(('the passage','passage')):
+                final_text = (final_text + "\nAnswer: " + lab + ". " + sup)
         # 场景 B（通用兜底）：完全无 Answer 或占位符
         if not _usable(final_text):
             for seed in ("\nAnswer:", "\nTherefore, the answer is:"):
@@ -541,6 +564,19 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
                     if _usable(final_text):
                         break
             gdec.max_new_tokens = saved
+    # 兜底归一化：官方抽取器只认 "Answer:"（Answer 后紧跟冒号），
+    # "Therefore, the answer is: <label>. <sentence>" 这类行永远抽不到。
+    # 若严格抽取仍为光杆标签，而宽松正则能找到带句子的答案行，
+    # 重写成规范 "Answer: ..." 作为全文最后一条。
+    a = _last_answer(final_text)
+    if (a and len(a.split()) <= 2
+            and a.rstrip('.').strip().lower() in ('yes', 'no', 'maybe')):
+        m = _re.findall(
+            r'(?:answer is|Answer is|answer:|Answer:)\s*:?"?\s*([^"\]\}\n]{24,})',
+            final_text)
+        m = [x.strip().rstrip('.') for x in m if len(x.strip().split()) >= 6]
+        if m:
+            final_text = final_text + "\nAnswer: " + m[-1]
     return prev_cont[best_beam] + final_text
 
 
@@ -570,6 +606,10 @@ def parse_args():
     p.add_argument('--least_foresight_num', type=int, default=4)
     p.add_argument('--threshold', type=float, default=0.75)
     p.add_argument('--cluster_k', type=int, default=3)
+    p.add_argument('--no_hooks', action='store_true',
+                   help='禁用 hidden-states 钩子（用于 torch.compile 场景）')
+    p.add_argument('--compile', action='store_true',
+                   help='torch.compile 模型（与钩子互斥，自动 no_hooks）')
     return p.parse_args()
 
 
@@ -586,9 +626,12 @@ def main():
     if scorer.tokenizer.pad_token is None:
         scorer.tokenizer.pad_token = scorer.tokenizer.eos_token
 
+    if args.compile:
+        scorer.model = torch.compile(scorer.model, dynamic=True)
     gdec = GuardedDecoder(scorer, temperature=args.temperature,
                           m_candidates=args.m_candidates,
-                          max_new_tokens=args.max_new_step)
+                          max_new_tokens=args.max_new_step,
+                          use_hooks=not (args.no_hooks or args.compile))
 
     import types
     pb = PromptBuilder(types.SimpleNamespace(

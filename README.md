@@ -122,6 +122,7 @@ The three stages:
 - **Stage 2 (segment representation):** weights `w_i = softmax(F)` (Eq. 5), `H_k` (Eq. 6), token/consistency/alignment scores (Eq. 7–9) — all computed from vectors cached during decoding (zero extra forward passes); segments in `[τ_seg_low, τ_seg_high)` are refined by rewriting only the 3-token window around the weakest token (Eq. 10, ≤N_max=3), per the paper.
 - **Stage 3 (global iteration):** `F_fact`/`F_logic` (Eq. 11–13), `F_global = ab/(a+b−ab)` (Eq. 14), TF-IDF + KMeans chain selection (§3.4), threshold adjustment (Eq. 15), ≤M_max=2 iterations, "cannot answer" when both scores < 0.5.
 - **Config:** sampling temperature **0.4** (paper §5.2), beam=4, ≤8 paragraph-level reasoning steps with early stopping (depth ≥4 when ≥75% of beams agree), and an answer-format probe that enforces the paper's `Answer:[...]` output convention (§3.1).
+- **Software-level speedups included** (no quantization required): per-token forward hooks capture only the two needed hidden layers (embedding + last decoder layer) instead of materializing all ~33 layers (measured **~1.5–2×** on identical outputs, byte-for-byte); run **two shards per GPU** for a further ~1.7× (`CUDA_VISIBLE_DEVICES=0 python tg_paper_impl.py --start_index 0 ... &  CUDA_VISIBLE_DEVICES=0 python tg_paper_impl.py --start_index 50 ... &`).
 
 ### Usage
 
