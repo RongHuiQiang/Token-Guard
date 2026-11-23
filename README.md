@@ -98,6 +98,31 @@ CUDA_VISIBLE_DEVICES=0 conda run -n tokenguard python run_guard.py \
 | `num_rollout` | `10` | Rollouts per beam per step |
 | `tau_global` | `0.7` | Global convergence threshold override (paper: 0.7; recommended: 0.65) |
 
+## Efficient Paper-Faithful Implementation (`guard/tg_paper_impl.py`, new)
+
+This release adds a from-scratch implementation of the **three-stage algorithm exactly as described in the paper** (§3.2–§3.4, Algorithm 1):
+
+- **Stage 1 (token-level self-checking, in the decode loop):** one KV-cached forward per token; top-M candidates sampled by probability; hybrid score `F = λ·cos(h_t, h̄_<t) + (1−λ)·P(a_t)` (Eq. 3, λ=0.6); candidates below `τ_token=0.4` break the current segment (Eq. 4–5); accepted hidden states update the running mean.
+- **Stage 2 (segment representation):** weights `w_i = softmax(F)` (Eq. 5), `H_k` (Eq. 6), token/consistency/alignment scores (Eq. 7–9) — all computed from vectors cached during decoding (zero extra forward passes); segments in `[τ_seg_low, τ_seg_high)` are refined by rewriting only the 3-token window around the weakest token (Eq. 10, ≤N_max=3), per the paper.
+- **Stage 3 (global iteration):** `F_fact`/`F_logic` (Eq. 11–13), `F_global = ab/(a+b−ab)` (Eq. 14), TF-IDF + KMeans chain selection (§3.4), threshold adjustment (Eq. 15), ≤M_max=2 iterations, "cannot answer" when both scores < 0.5.
+- **Config:** sampling temperature **0.4** (paper §5.2), beam=4, ≤8 paragraph-level reasoning steps with early stopping (depth ≥4 when ≥75% of beams agree), and an answer-format probe that enforces the paper's `Answer:[...]` output convention (§3.1).
+
+### Usage
+
+```bash
+cd guard
+# one dataset, 100 samples, single GPU
+bash run_paper_impl.sh 0 PubmedQA 100
+# or directly:
+CUDA_VISIBLE_DEVICES=0 python tg_paper_impl.py \
+    --model_path ../models/Meta-Llama-3.1-8B-Instruct \
+    --datasets pubmedqa --data_path ../data/PubmedQA.json \
+    --max_examples 100 --temperature 0.4 --seed 0 \
+    --output_dir ../results/paper_impl --file_name PubmedQA
+```
+
+Output is JSONL (`id/question/passage/ground_truth/response/time_sec`), scored with the same `eval/` scripts as the original pipeline.
+
 ## BibTeX
 
 ```bibtex
