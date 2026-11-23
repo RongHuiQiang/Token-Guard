@@ -28,6 +28,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+_TG_GUARD = os.path.join(_HERE, "Token-Guard-main", "guard")
+if _TG_GUARD not in sys.path:
+    sys.path.insert(0, _TG_GUARD)
+
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
@@ -37,10 +44,100 @@ from prompt_builder import PromptBuilder
 from beam_search import BeamSearchEngine  # noqa: F401 (_unused; keep parity of imports)
 import generation_utils
 
+from transformers import DynamicCache
 
 # ----------------------------------------------------------------------------
-# 解码时逐 token 守门（Algorithm 1 Phase 1）
+# 可观测性（TG_PHASE=1）与 KV 复用（TG_KVREUSE=1）开关；默认全关 = 原行为
 # ----------------------------------------------------------------------------
+TG_PHASE = os.environ.get("TG_PHASE", "0") == "1"
+KVREUSE = os.environ.get("TG_KVREUSE", "1") != "0"
+KVDEBUG = os.environ.get("TG_KVDEBUG", "0") == "1"
+REUSE_STATS = {"calls": 0, "reuse_ok": 0, "prefill_tok_full": 0,
+               "prefill_tok_fed": 0}
+
+
+def _kvdbg(msg):
+    if KVDEBUG:
+        print(f"[kvdbg] {msg}", flush=True)
+
+PHASE_CALLS = []                 # 每次 decode/decode_batch 的一条记录
+PHASE_CTX = {"ex": -1, "phase": None, "t0": 0.0}
+PHASE_WALL = {}                  # phase -> 秒
+
+
+def _phase_set(name):
+    """切换 phase 桶（关闭上一个的墙钟计时）。TG_PHASE=0 时零开销。"""
+    if not TG_PHASE:
+        return
+    now = time.perf_counter()
+    if PHASE_CTX["phase"] is not None:
+        k = PHASE_CTX["phase"]
+        PHASE_WALL[k] = PHASE_WALL.get(k, 0.0) + (now - PHASE_CTX["t0"])
+    PHASE_CTX["phase"] = name
+    PHASE_CTX["t0"] = now
+
+
+def _phase_record(kind, B, Lw, real, prefill_s, decode_s, steps, gen):
+    if not TG_PHASE:
+        return
+    PHASE_CALLS.append({
+        "ex": PHASE_CTX["ex"], "phase": PHASE_CTX["phase"] or "other",
+        "kind": kind, "B": B, "Lw": int(Lw), "real": int(real),
+        "prefill_s": round(prefill_s, 4), "decode_s": round(decode_s, 4),
+        "steps": steps, "gen": gen,
+    })
+
+
+def _phase_dump(output_dir):
+    if TG_PHASE:
+        with open(os.path.join(output_dir, "phase_calls.jsonl"), "w") as f:
+            for r in PHASE_CALLS:
+                f.write(json.dumps(r) + "\n")
+        with open(os.path.join(output_dir, "phase_wall.json"), "w") as f:
+            json.dump(PHASE_WALL, f, indent=1)
+        print(f"[phase] {len(PHASE_CALLS)} calls dumped", flush=True)
+    if KVREUSE:
+        with open(os.path.join(output_dir, "reuse_stats.json"), "w") as f:
+            json.dump(REUSE_STATS, f, indent=1)
+        print(f"[kvreuse] {REUSE_STATS}", flush=True)
+
+
+# ----------------------------------------------------------------------------
+# 跨步 KV 复用（TG_KVREUSE=1）：verified prefix-crop + tail-feed
+#
+# cache = {"past": DynamicCache, "ids": LongTensor[B,S], "mask": [0..0,1..1]}
+#   不变量：每行 = 左 pad + 连续内容（prompt+已生成 token），mask 与 past 列对齐。
+# 新调用带 cache 时：照常 fresh encode 新 prompt（保持左 pad/左截断语义）→
+# 逐行与缓存内容做最长公共前缀（LCP）→ 缓存 KV 裁到前缀、重排到新布局 →
+# 剩余 tail token 一次前向喂入（绝对 position_ids）→ 进正常解码环。
+# 喂入的 token 序列与全量 prefill 完全一致，仅省掉重复前缀计算；
+# LCP=0 / 结构不匹配 / 截断失配 → 自动回退旧的全量 prefill 路径。
+# ----------------------------------------------------------------------------
+
+def _lcp_prefix_len(a, b):
+    """1-D LongTensor a/b 的最长公共前缀长度。"""
+    n = min(a.numel(), b.numel())
+    if n == 0:
+        return 0
+    eq = a[:n] == b[:n]
+    if bool(eq.all()):
+        return n
+    ne = (~eq).nonzero(as_tuple=True)[0]
+    return int(ne[0].item())
+
+
+def kv_row(cache, b):
+    """抽取批 cache 的第 b 行为单行 cache（from_legacy_cache 内部复制，安全）。"""
+    if cache is None:
+        return None
+    try:
+        past = DynamicCache.from_legacy_cache(tuple(
+            (l.keys[b:b + 1], l.values[b:b + 1]) for l in cache["past"].layers))
+        return {"past": past, "ids": cache["ids"][b:b + 1],
+                "mask": cache["mask"][b:b + 1]}
+    except Exception:
+        return None
+
 
 class GuardedDecoder:
     def __init__(self, scorer, temperature=0.7, m_candidates=5,
@@ -67,11 +164,13 @@ class GuardedDecoder:
                     0, o[0] if isinstance(o, tuple) else o))
 
     @torch.no_grad()
-    def decode(self, prompt_text, h_bar_init, stop_str=None):
-        """Guarded continuation. Returns (text, segments, n_tokens, n_gate_fail).
+    def decode(self, prompt_text, h_bar_init, stop_str=None, cache=None):
+        """Guarded continuation. Returns (text, segments, n_tokens, n_gate_fail, cache).
 
         segments: list of dicts {hiddens[T,d], embeds[T,d], scores[T]} for each
         run of consecutive τ_token-passing tokens (paper §3.2 段形成规则).
+        cache: TG_KVREUSE=1 时返回本次调用的 KV 缓存（prompt+已生成 token），
+        供下一次前缀复用；关闭时恒为 None。
         """
         model, tok, cfg = self.model, self.tokenizer, self.cfg
         device = self.scorer.device
@@ -88,6 +187,22 @@ class GuardedDecoder:
         past = None
         n_prompt = input_ids.shape[1]
 
+        # KV 复用：裁缓存到 LCP 前缀，tail 一次前向（无 pad → 默认绝对 position）
+        reuse = (self._setup_reuse_single(cache, input_ids)
+                 if KVREUSE and cache is not None else None)
+        if reuse is not None:
+            past = reuse["past"]
+            cur = input_ids[:, reuse["plen"]:]
+            REUSE_STATS["reuse_ok"] += 1
+            REUSE_STATS["prefill_tok_fed"] += n_prompt - reuse["plen"]
+        elif KVREUSE and cache is not None:
+            REUSE_STATS["prefill_tok_fed"] += n_prompt
+        if KVREUSE and cache is not None:
+            REUSE_STATS["calls"] += 1
+            REUSE_STATS["prefill_tok_full"] += n_prompt
+        if reuse is None:
+            cur = input_ids
+
         h_bar = h_bar_init.clone().to(device)
         t_offset = 1                      # |accepted| + 1 (anchor counted)
 
@@ -97,10 +212,21 @@ class GuardedDecoder:
         segments = []
         n_gate_fail = 0
 
-        cur = input_ids
+        _pf_s = _dec_s = 0.0
+        _steps = 0
+        _first = True
         for _ in range(self.max_new_tokens):
+            if TG_PHASE:
+                _t0 = time.perf_counter()
             out = model(cur, past_key_values=past, use_cache=True,
                         output_hidden_states=not self.use_hooks)
+            if TG_PHASE:
+                _dt = time.perf_counter() - _t0
+                if _first:
+                    _pf_s, _first = _dt, False
+                else:
+                    _dec_s += _dt
+                    _steps += 1
             past = out.past_key_values
             logits = out.logits[0, -1].float()
             if self.use_hooks:
@@ -165,19 +291,38 @@ class GuardedDecoder:
                           skip_special_tokens=True)
         if stop_str and stop_str in text:
             text = text.split(stop_str)[0]
-        return text, segments, len(out_ids), n_gate_fail
+        new_cache = None
+        if KVREUSE:
+            try:
+                # 环最后一次 append 的 pick 未被前向（无 KV）→ 只保留 past 覆盖的 token
+                kept = min(len(out_ids),
+                           max(past.get_seq_length() - n_prompt, 0))
+                gen = torch.tensor(out_ids[:kept], dtype=torch.long,
+                                   device=device)
+                new_cache = {
+                    "past": past,
+                    "ids": torch.cat([input_ids, gen[None]], dim=1),
+                    "mask": torch.ones(1, n_prompt + kept,
+                                       dtype=input_ids.dtype, device=device),
+                }
+            except Exception:
+                new_cache = None
+        _phase_record("decode", 1, n_prompt, n_prompt, _pf_s, _dec_s,
+                      _steps + 1, len(out_ids))
+        return text, segments, len(out_ids), n_gate_fail, new_cache
 
 
     # ------------------------------------------------------------------
     # 批量版：B 条 beam 同步解码（算法/打分逐行同 decode()，只是合批）
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def decode_batch(self, prompt_texts, h_bar_init, stop_str=None):
+    def decode_batch(self, prompt_texts, h_bar_init, stop_str=None, cache=None):
         """Batched guarded continuation for B prompts (left padding).
         Per-row semantics identical to decode(): top-M sampled candidates,
         F = λ·cos(h_pos, h̄_r) + (1−λ)·P, τ gate, running mean, segments,
         per-row stop. RNG consumption order differs from sequential decode,
-        so sampled tokens differ (same distribution)."""
+        so sampled tokens differ (same distribution).
+        cache: TG_KVREUSE=1 时用于前缀复用并返回新缓存（results, cache）。"""
         model, tok, cfg = self.model, self.tokenizer, self.cfg
         device = self.scorer.device
         B = len(prompt_texts)
@@ -206,10 +351,35 @@ class GuardedDecoder:
 
         cur, past, positions = input_ids, None, pos_ids
         mask_full = attn
+        layout = {"mode": "fresh", "Rw": real_len}
+        if KVREUSE and cache is not None:
+            ru = self._setup_reuse_batch(cache, input_ids, attn)
+            if ru is not None:
+                cur, past, positions, mask_full = (ru["cur"], ru["past"],
+                                                   ru["positions"], ru["mask_full"])
+                layout = ru["layout"]
+                REUSE_STATS["reuse_ok"] += 1
+                REUSE_STATS["prefill_tok_fed"] += sum(int(x) for x in layout["tb"])
+            else:
+                REUSE_STATS["prefill_tok_fed"] += int(attn.sum())
+            REUSE_STATS["calls"] += 1
+            REUSE_STATS["prefill_tok_full"] += int(attn.sum())
+        _pf_s = _dec_s = 0.0
+        _steps = 0
+        _first = True
         for t in range(self.max_new_tokens):
+            if TG_PHASE:
+                _t0 = time.perf_counter()
             out = model(cur, past_key_values=past, attention_mask=mask_full,
                         position_ids=positions, use_cache=True,
                         output_hidden_states=not self.use_hooks)
+            if TG_PHASE:
+                _dt = time.perf_counter() - _t0
+                if _first:
+                    _pf_s, _first = _dt, False
+                else:
+                    _dec_s += _dt
+                    _steps += 1
             past = out.past_key_values
             logits = out.logits[:, -1].float()                       # [B, V]
             if self.use_hooks:
@@ -273,7 +443,13 @@ class GuardedDecoder:
             if stop_str and stop_str in text:
                 text = text.split(stop_str)[0]
             results.append((text, segments[r], len(out_ids[r]), n_fail[r]))
-        return results
+        new_cache = None
+        if KVREUSE:
+            new_cache = self._pack_batch_cache(past, input_ids, out_ids, layout)
+        _phase_record("decode_batch", B, input_ids.shape[1],
+                      int(attn.sum()), _pf_s, _dec_s, _steps + 1,
+                      sum(len(o) for o in out_ids))
+        return results, new_cache
 
     def _close_segment(self, buf):
         return {
@@ -281,6 +457,162 @@ class GuardedDecoder:
             "embeds": torch.stack(buf["e"]),
             "scores": buf["f"],
         }
+
+    # ------------------------------------------------------------------
+    # KV 复用：单行 / 批量 setup 与 pack（任何异常 → None → 回退旧路径）
+    # ------------------------------------------------------------------
+    def _setup_reuse_single(self, cache, input_ids):
+        """单行：input_ids [1, Rw] 无 pad。裁缓存行到 LCP 前缀，tail 作首前向。
+        无 pad → 模型默认 position=arange(past_len, past_len+tail) 恰为绝对位置。"""
+        try:
+            past, cids, cmask = cache["past"], cache["ids"], cache["mask"]
+        except (TypeError, KeyError):
+            return None
+        try:
+            if cids.shape[0] != 1 or past.get_seq_length() != cids.shape[1]:
+                _kvdbg(f"single: shape {cids.shape} vs seq {past.get_seq_length()}")
+                return None
+            if cids.device != input_ids.device:
+                _kvdbg("single: device")
+                return None
+            Rc = int(cmask.sum())
+            cstart = cids.shape[1] - Rc
+            Rw = input_ids.shape[1]
+            p = min(_lcp_prefix_len(input_ids[0], cids[0, cstart:]), Rw - 1)
+            if p <= 0:
+                _kvdbg(f"single: lcp=0 (Rw={Rw} Rc={Rc})")
+                return None
+            _kvdbg(f"single: Rw={Rw} Rc={Rc} plen={p}")
+            layers = tuple((l.keys[:, :, :p, :], l.values[:, :, :p, :])
+                           for l in past.layers)
+            return {"past": DynamicCache.from_legacy_cache(layers),
+                    "cur": input_ids[:, p:], "plen": p}
+        except Exception:
+            return None
+
+    def _setup_reuse_batch(self, cache, input_ids, attn):
+        """批版 prefix-crop + tail-feed。行布局（past 宽 K，tail 前向后 K+T）：
+        row b = [K-Kb 零][前缀 KV plen_b][Kb-plen 零(=该行 want 左 pad 宽)][tail 零 T-tb][tail KV tb]
+        mask 与之一致；tail 用绝对 position_ids。返回 None → 全量 prefill。"""
+        try:
+            past, cids, cmask = cache["past"], cache["ids"], cache["mask"]
+        except (TypeError, KeyError):
+            return None
+        try:
+            B, Lw = input_ids.shape
+            if cids.shape[0] != B or past.get_seq_length() != cids.shape[1]:
+                _kvdbg(f"batch: B {cids.shape[0]} vs {B}; seq "
+                       f"{past.get_seq_length()} vs {cids.shape[1]}")
+                return None
+            if cmask.shape != cids.shape or cids.device != input_ids.device:
+                _kvdbg("batch: mask/device")
+                return None
+            dev = input_ids.device
+            Rw = attn.sum(dim=1)                      # [B] want 真实长度
+            Rc = cmask.sum(dim=1)                     # [B] 缓存内容长度
+            cstart = cids.shape[1] - Rc               # 不变量 [0..0,1..1]
+            plen = torch.zeros(B, dtype=torch.long, device=dev)
+            for b in range(B):
+                w = input_ids[b, Lw - int(Rw[b]):]
+                c = cids[b, int(cstart[b]):]
+                plen[b] = min(_lcp_prefix_len(w, c), int(Rw[b]) - 1)
+            if int(plen.max()) <= 0:
+                _kvdbg(f"batch: all lcp=0 Rw={Rw.tolist()} Rc={Rc.tolist()}")
+                return None
+            _kvdbg(f"batch: Rw={Rw.tolist()} Rc={Rc.tolist()} plen={plen.tolist()}")
+            Kb = (Lw - Rw) + plen                     # [B] 前缀区宽（含新左 pad）
+            K = int(Kb.max())
+            tb = Rw - plen
+            T = int(tb.max())
+            # 逐层：裁每行到缓存内容前 plen_b，重排到宽 K（左零 = K-Kb，右零 = Kb-plen）
+            layers = []
+            for l in past.layers:
+                rk, rv = [], []
+                for b in range(B):
+                    s, p, kb = int(cstart[b]), int(plen[b]), int(Kb[b])
+                    kp = F.pad(l.keys[b:b + 1, :, s:s + p, :],
+                               (0, 0, K - kb, kb - p))
+                    vp = F.pad(l.values[b:b + 1, :, s:s + p, :],
+                               (0, 0, K - kb, kb - p))
+                    rk.append(kp)
+                    rv.append(vp)
+                layers.append((torch.cat(rk, dim=0), torch.cat(rv, dim=0)))
+            new_past = DynamicCache.from_legacy_cache(tuple(layers))
+            # tail 输入（左 pad 到 T）+ 绝对 position + 合成 mask
+            pad_tok = self.tokenizer.pad_token_id
+            tail_ids = torch.full((B, T), pad_tok, dtype=torch.long, device=dev)
+            tail_mask = torch.zeros(B, T, dtype=attn.dtype, device=dev)
+            tail_pos = torch.zeros(B, T, dtype=torch.long, device=dev)
+            mask_prefix = torch.zeros(B, K, dtype=attn.dtype, device=dev)
+            for b in range(B):
+                p, r, t_b, kb = int(plen[b]), int(Rw[b]), int(tb[b]), int(Kb[b])
+                tail_ids[b, T - t_b:] = input_ids[b, Lw - r + p: Lw]
+                tail_mask[b, T - t_b:] = 1
+                tail_pos[b, T - t_b:] = torch.arange(p, r, device=dev)
+                mask_prefix[b, K - kb:K - kb + p] = 1
+            mask_full = torch.cat([mask_prefix, tail_mask], dim=1)
+            layout = {"mode": "reuse", "Rw": Rw, "K": K, "Kb": Kb,
+                      "plen": plen, "T": T, "tb": tb}
+            return {"past": new_past, "cur": tail_ids, "positions": tail_pos,
+                    "mask_full": mask_full, "layout": layout}
+        except Exception:
+            return None
+
+    def _pack_batch_cache(self, past, input_ids, out_ids, layout):
+        """把解码环结束后的（可能带洞）past 压回不变量布局 [左pad][内容]，ids/mask 同步。
+        内容 = want + 已生成；行内三段列范围由 layout 给出。"""
+        try:
+            B, Lw = input_ids.shape
+            dev = input_ids.device
+            Rw = layout["Rw"]
+            # 环最后一次 append 的 pick 未被前向：G'=past宽-Lw 为已前向的生成 token 数
+            gmax = max(past.get_seq_length() - Lw, 0) if layout["mode"] == "fresh" \
+                else max(past.get_seq_length() - layout["K"] - layout["T"], 0)
+            keep = [min(len(out_ids[b]), gmax) for b in range(B)]
+            cw = [int(Rw[b]) + keep[b] for b in range(B)]
+            C = max(cw)
+            pad_tok = self.tokenizer.pad_token_id
+            if layout["mode"] == "fresh":
+                ranges = [[(Lw - int(Rw[b]), Lw), (Lw, Lw + keep[b])]
+                          for b in range(B)]
+            else:
+                K, Kb = layout["K"], layout["Kb"]
+                plen, tb, T = layout["plen"], layout["tb"], layout["T"]
+                ranges = []
+                for b in range(B):
+                    p, r, g = int(plen[b]), int(Rw[b]), keep[b]
+                    kb, t_b = int(Kb[b]), int(tb[b])
+                    ranges.append([(K - kb, K - kb + p),
+                                   (K + T - t_b, K + T),
+                                   (K + T, K + T + g)])
+            layers = []
+            for l in past.layers:
+                rk, rv = [], []
+                for b in range(B):
+                    kp = torch.cat([l.keys[b:b + 1, :, a:c, :]
+                                    for a, c in ranges[b]], dim=2)
+                    vp = torch.cat([l.values[b:b + 1, :, a:c, :]
+                                    for a, c in ranges[b]], dim=2)
+                    lp = C - cw[b]
+                    if lp > 0:
+                        kp = F.pad(kp, (0, 0, lp, 0))
+                        vp = F.pad(vp, (0, 0, lp, 0))
+                    rk.append(kp)
+                    rv.append(vp)
+                layers.append((torch.cat(rk, dim=0), torch.cat(rv, dim=0)))
+            new_past = DynamicCache.from_legacy_cache(tuple(layers))
+            ids = torch.full((B, C), pad_tok, dtype=torch.long, device=dev)
+            mask = torch.zeros(B, C, dtype=input_ids.dtype, device=dev)
+            for b in range(B):
+                r = int(Rw[b])
+                ids[b, C - cw[b]:C - cw[b] + r] = input_ids[b, Lw - r:]
+                if keep[b]:
+                    ids[b, C - cw[b] + r:] = torch.tensor(
+                        out_ids[b][:keep[b]], dtype=torch.long, device=dev)
+                mask[b, C - cw[b]:] = 1
+            return {"past": new_past, "ids": ids, "mask": mask}
+        except Exception:
+            return None
 
 
 # ----------------------------------------------------------------------------
@@ -318,8 +650,9 @@ def score_segment(scorer, seg, h_x):
 
 
 def refine_window(scorer, gdec, context_text, step_text, seg, h_x,
-                  max_retries=3):
-    """Eq.10: 找最弱 token，重写其 3-token 窗口，重打分取优。"""
+                  max_retries=3, cache=None):
+    """Eq.10: 找最弱 token，重写其 3-token 窗口，重打分取优。
+    cache: TG_KVREUSE=1 时传入单行缓存（context_text+prefix 前缀应大段命中）。"""
     cfg = scorer.config
     adj_low = cfg.tau_seg_low - scorer.current_threshold_adj
     adj_high = cfg.tau_seg_high + scorer.current_threshold_adj
@@ -341,8 +674,8 @@ def refine_window(scorer, gdec, context_text, step_text, seg, h_x,
         prefix = gdec.tokenizer.decode(ids[:s], skip_special_tokens=True)
         saved_max = gdec.max_new_tokens
         gdec.max_new_tokens = e - s                 # 只生成窗口大小
-        new_text, new_segs, _n, _g = gdec.decode(
-            context_text + prefix, h_x, stop_str=None)
+        new_text, new_segs, _n, _g, _c = gdec.decode(
+            context_text + prefix, h_x, stop_str=None, cache=cache)
         gdec.max_new_tokens = saved_max
         new_text = gdec.tokenizer.decode(
             list(ids[:s])
@@ -431,18 +764,28 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
                                     question=example.get('question', ''))
     anchor_ctx = (f"{system_prompt}\nPassage: {passage}\n"
                   f"Question: {example['question']}\n")
+    _phase_set("anchor")
+    _t0 = time.perf_counter()
     h_x = scorer.initialize_anchor(anchor_ctx)
+    if TG_PHASE:
+        _n_anchor = len(scorer.tokenizer(anchor_ctx)["input_ids"])
+        _phase_record("anchor_fwd", 1, _n_anchor, _n_anchor,
+                      time.perf_counter() - _t0, 0.0, 0, 0)
 
     # prev_cont = 纯续写文本（不含 prompt，与官方 decoder 口径一致）
     prev_cont = ["The reasoning steps are:\n\n" for _ in range(args.step_beam_size)]
     beam_chains = [[] for _ in range(args.step_beam_size)]      # CandidateSegment lists
 
+    batch_cache = None                     # TG_KVREUSE：foresight 跨步批缓存
     for _step in range(args.num_foresight):
         done_all = True
         step_texts = []
         # 每步 = 一个推理段落（空行边界）；4 条 beam 合批解码（逐行语义同单条）
         step_prompts = [base_prompt + prev_cont[b] for b in range(args.step_beam_size)]
-        batch_out = gdec.decode_batch(step_prompts, h_x, stop_str="\n\n")
+        _phase_set("stage1")
+        batch_out, batch_cache = gdec.decode_batch(step_prompts, h_x,
+                                                   stop_str="\n\n",
+                                                   cache=batch_cache)
         for b in range(args.step_beam_size):
             step_prompt = step_prompts[b]
             text, segs, _n, _nf = batch_out[b]
@@ -456,8 +799,11 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
                         cand_segs.append(cs)
                 if cand_segs:
                     seg = cand_segs[-1]
+                    _phase_set("refine")
                     seg, text = refine_window(scorer, gdec, step_prompt,
-                                              text, seg, h_x)
+                                              text, seg, h_x,
+                                              cache=kv_row(batch_cache, b))
+                    _phase_set("stage1")
                     seg.text = text
                     beam_chains[b].append(seg)
                 step_texts.append(text.strip())
@@ -473,6 +819,7 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
                 break
 
     # Phase 3: 链级评估（Eq.11-14）+ TF-IDF/KMeans 链选择（§3.4）
+    _phase_set("select")
     beam_full_texts = [prev_cont[b] for b in range(args.step_beam_size)]
     best_chain, best_f, best_beam = select_chain_by_clustering(
         beam_chains, beam_full_texts, scorer, k=args.cluster_k)
@@ -489,13 +836,16 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
             break
         wi = min(range(len(best_chain)),
                  key=lambda k: best_chain[k].segment_score)
+        _phase_set("refine")
         seg, _t = refine_window(scorer, gdec, anchor_ctx,
                                 best_chain[wi].text, best_chain[wi], h_x,
                                 max_retries=1)
+        _phase_set("select")
         best_chain[wi] = seg
         best_f, _, _ = chain_global_score(scorer, best_chain)
 
     if cannot or not best_chain:
+        _phase_set(None)
         return "cannot answer"
 
     # final answer：guarded decode
@@ -504,7 +854,10 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
     final_prompt = tok.apply_chat_template(chat, tokenize=False) \
         .rstrip(tok.eos_token).rstrip()
     gdec.max_new_tokens = args.max_new_final
-    final_text, _segs, _n, _nf = gdec.decode(final_prompt, h_x, stop_str=None)
+    _phase_set("final")
+    final_text, _segs, _n, _nf, final_cache = gdec.decode(
+        final_prompt, h_x, stop_str=None, cache=kv_row(batch_cache, best_beam))
+    _phase_set("probes")
 
     # Answer 探针：论文 §3.1 的通用 prompt 强制 "Answer:[...]" 输出格式；
     # 模型常把推理步写成通用计划后直接 EOS，不再作答。官方管线靠 3000-token
@@ -544,10 +897,10 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
             # 模型只能续出内容句（对"给一句依据"的开放式请求模型常摆烂回标签）
             lab = a.rstrip('.').strip()
             gdec.max_new_tokens = 128
-            sup, _s, _n, _g = gdec.decode(
+            sup, _s, _n, _g, _c = gdec.decode(
                 final_prompt + final_text
                 + "\nAnswer: " + lab + ". The passage",
-                h_x, stop_str=None)
+                h_x, stop_str=None, cache=final_cache)
             gdec.max_new_tokens = saved
             sup = ("The passage " + sup.strip()).strip('"')
             sup = _re.sub(r'^(yes|no|maybe)[.:]\s*', '', sup, flags=_re.I).strip()
@@ -557,8 +910,9 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
         if not _usable(final_text):
             for seed in ("\nAnswer:", "\nTherefore, the answer is:"):
                 gdec.max_new_tokens = 256
-                probe, _s, _n, _g = gdec.decode(
-                    final_prompt + final_text + seed, h_x, stop_str=None)
+                probe, _s, _n, _g, _c = gdec.decode(
+                    final_prompt + final_text + seed, h_x, stop_str=None,
+                    cache=final_cache)
                 if probe.strip() and not probe.strip().startswith('['):
                     final_text = final_text + seed + probe
                     if _usable(final_text):
@@ -577,6 +931,7 @@ def process_example(scorer, gdec, pb, args, example, system_prompt, dataset):
         m = [x.strip().rstrip('.') for x in m if len(x.strip().split()) >= 6]
         if m:
             final_text = final_text + "\nAnswer: " + m[-1]
+    _phase_set(None)
     return prev_cont[best_beam] + final_text
 
 
@@ -654,10 +1009,12 @@ def main():
         t0 = time.time()
         sysprompt = pb.get_system_prompt(args.datasets)
         try:
+            PHASE_CTX["ex"] = i
             resp = process_example(scorer, gdec, pb, args, ex, sysprompt,
                                    args.datasets)
         except Exception as e:
             import traceback; traceback.print_exc()
+            _phase_set(None)
             resp = ""
             print(f"  [ERROR] {e}", flush=True)
         dt = time.time() - t0
@@ -671,6 +1028,7 @@ def main():
         print(f"[{i+1}/{max_num}] {dt:.1f}s  resp_len={len(resp)}", flush=True)
 
     print(f"TOTAL {time.time()-t_all:.1f}s  avg {(time.time()-t_all)/max_num:.1f}s")
+    _phase_dump(args.output_dir)
 
 
 if __name__ == '__main__':
